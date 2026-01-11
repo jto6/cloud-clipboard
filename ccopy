@@ -1,0 +1,157 @@
+#!/usr/bin/env bash
+#
+# ccopy - Cloud Copy: Copy clipboard content to a GitHub repo
+#
+# Usage: ccopy [-b branch] [-m message]
+#
+# Environment:
+#   CLIPBOARD_REPO_PATH - Path to the local clone of your clipboard GitHub repo
+#
+
+set -euo pipefail
+
+# Defaults
+BRANCH="main"
+MESSAGE=""
+VERBOSE=false
+
+# Parse arguments
+while [[ $# -gt 0 ]]; do
+	case $1 in
+		-b|--branch)
+			if [[ -z "${2:-}" || "$2" == -* ]]; then
+				echo "Error: -b/--branch requires a branch name" >&2
+				exit 1
+			fi
+			BRANCH="$2"
+			shift 2
+			;;
+		-m|--message)
+			if [[ -z "${2:-}" || "$2" == -* ]]; then
+				echo "Error: -m/--message requires a message" >&2
+				exit 1
+			fi
+			MESSAGE="$2"
+			shift 2
+			;;
+		-v|--verbose)
+			VERBOSE=true
+			shift
+			;;
+		-h|--help)
+			echo "Usage: ccopy [-b branch] [-m message] [-v]"
+			echo ""
+			echo "Copy clipboard content to GitHub repo"
+			echo ""
+			echo "Options:"
+			echo "  -b, --branch BRANCH   Branch to use (default: main)"
+			echo "  -m, --message MSG     Optional commit message annotation"
+			echo "  -v, --verbose         Show git output"
+			echo "  -h, --help            Show this help"
+			echo ""
+			echo "Environment:"
+			echo "  CLIPBOARD_REPO_PATH   Path to local clone of clipboard repo (required)"
+			exit 0
+			;;
+		*)
+			echo "Unknown option: $1" >&2
+			exit 1
+			;;
+	esac
+done
+
+# Check for repo path
+if [[ -z "${CLIPBOARD_REPO_PATH:-}" ]]; then
+	echo "Error: CLIPBOARD_REPO_PATH environment variable not set" >&2
+	echo "Set it to the path of your cloned clipboard GitHub repo" >&2
+	exit 1
+fi
+
+if [[ ! -d "$CLIPBOARD_REPO_PATH/.git" ]]; then
+	echo "Error: $CLIPBOARD_REPO_PATH is not a git repository" >&2
+	exit 1
+fi
+
+# Detect clipboard command based on OS
+get_clipboard() {
+	if [[ "$OSTYPE" == "darwin"* ]]; then
+		pbpaste
+	elif command -v xclip &>/dev/null; then
+		xclip -selection clipboard -o
+	elif command -v xsel &>/dev/null; then
+		xsel --clipboard --output
+	elif command -v wl-paste &>/dev/null; then
+		wl-paste
+	else
+		echo "Error: No clipboard tool found. Install xclip, xsel, or wl-paste" >&2
+		exit 1
+	fi
+}
+
+# Get clipboard content
+CONTENT=$(get_clipboard)
+
+if [[ -z "$CONTENT" ]]; then
+	echo "Error: Clipboard is empty" >&2
+	exit 1
+fi
+
+cd "$CLIPBOARD_REPO_PATH"
+
+# Helper to run git commands with optional output suppression
+run_git() {
+	if [[ "$VERBOSE" == true ]]; then
+		git "$@"
+	else
+		git "$@" &>/dev/null
+	fi
+}
+
+# Fetch latest
+run_git fetch origin || true
+
+# Check if branch exists remotely or locally
+if git show-ref --verify --quiet "refs/remotes/origin/$BRANCH" 2>/dev/null; then
+	# Branch exists remotely, check it out
+	run_git checkout "$BRANCH" || run_git checkout -b "$BRANCH" "origin/$BRANCH"
+	run_git pull origin "$BRANCH" --rebase || true
+elif git show-ref --verify --quiet "refs/heads/$BRANCH" 2>/dev/null; then
+	# Branch exists locally
+	run_git checkout "$BRANCH"
+else
+	# Create new branch from current HEAD
+	run_git checkout -b "$BRANCH"
+fi
+
+# Write content to file
+echo "$CONTENT" > clipboard.txt
+
+# Generate commit message
+TIMESTAMP=$(date '+%Y-%m-%d %H:%M:%S')
+PREVIEW=$(echo "$CONTENT" | head -c 50 | tr '\n' ' ')
+if [[ ${#CONTENT} -gt 50 ]]; then
+	PREVIEW="${PREVIEW}..."
+fi
+
+COMMIT_MSG="[$TIMESTAMP] $PREVIEW"
+if [[ -n "$MESSAGE" ]]; then
+	COMMIT_MSG="[$TIMESTAMP] $MESSAGE: $PREVIEW"
+fi
+
+# Commit and push
+run_git add clipboard.txt
+if [[ "$VERBOSE" == true ]]; then
+	git commit -m "$COMMIT_MSG" || {
+		echo "Nothing to commit (clipboard content unchanged)"
+		exit 0
+	}
+else
+	git commit -m "$COMMIT_MSG" &>/dev/null || {
+		echo "Nothing to commit (clipboard content unchanged)"
+		exit 0
+	}
+fi
+
+run_git push -u origin "$BRANCH"
+
+echo "✓ Copied to branch '$BRANCH'"
